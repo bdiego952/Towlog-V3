@@ -448,7 +448,8 @@
       <img data-pid="${pid}" alt="attached screenshot">
       <div class="mrow" style="margin-top:12px">
         <button class="btn ghost lbl" data-phdel style="color:var(--alarm);flex:0 0 auto;width:auto;padding:12px 16px">Remove</button>
-        <button class="btn lbl" data-close>Close</button>
+        <button class="btn primary lbl" data-phscan>Read into case</button>
+        <button class="btn lbl" data-close style="flex:0 0 auto;width:auto;padding:12px 16px">Close</button>
       </div></div>`;
     el.addEventListener('click',e=>{
       if(e.target===el||e.target.closest('[data-close]')){el.remove();return;}
@@ -457,9 +458,123 @@
         if(c){c.photos=(c.photos||[]).filter(x=>x!==pid);idbImgDel(pid);persist();}
         el.remove();render();toast('Removed');
       }
+      if(e.target.closest('[data-phscan]')){el.remove();scanPhoto(pid);}
     });
     document.body.appendChild(el);hydratePhotos();
   }
+  /* ---------- read a screenshot into the case ---------- */
+  function loadScript(src){return new Promise((res,rej)=>{const sc=document.createElement('script');sc.src=src;sc.onload=res;sc.onerror=rej;document.head.appendChild(sc);});}
+
+  const FIELD_LABELS={
+    boatName:['boat name','vessel name','vessel','boat'],
+    make:['make','manufacturer','brand'],
+    length:['length','loa','boat length'],
+    color:['color','colour'],
+    boatType:['boat type','vessel type','type'],
+    regNum:['registration','registration #','reg #','reg number','cf number','cf #'],
+    ownerPhone:['phone','phone number','cell','mobile','contact number'],
+    ownerEmail:['email','e-mail'],
+    memId:['member id','member #','member number','membership','mem id'],
+    coverage:['coverage','coverage level'],
+    expDate:['exp date','expiration','expires','exp'],
+    dispatchNum:['dispatch #','dispatch number','dispatch','case #','case number'],
+    refNum:['ref num','ref #','reference'],
+    pob:['pob','persons on board','people on board','# pob'],
+    locText:['tow location','current location','location','position'],
+    dest:['destination','tow to','tow destination'],
+    reason:['reason','reason for tow','issue','problem','service type','service needed'],
+    eta:['eta'],
+    contacted:['time contacted','contacted']
+  };
+  const PRETTY={boatName:'Boat name',make:'Make',length:'Length',color:'Color',boatType:'Type',regNum:'Registration #',
+    ownerFirst:'First name',ownerLast:'Last name',ownerPhone:'Phone',ownerEmail:'Email',memId:'Member ID',coverage:'Coverage',
+    expDate:'Exp date',dispatchNum:'Dispatch #',refNum:'Ref num',pob:'POB',locText:'Tow location',dest:'Destination',
+    reason:'Reason',eta:'ETA',contacted:'Time contacted'};
+
+  function parseDispatch(text){
+    const found={};
+    const lines=text.split(/\n+/).map(l=>l.trim()).filter(Boolean);
+    const grab=(line,next)=>{
+      const m=line.match(/^([A-Za-z #\/-]{2,26}?)\s*[:\-–]\s*(.+)$/);
+      if(m){return {label:m[1].toLowerCase().trim(),value:m[2].trim()};}
+      // label on its own line, value on the next
+      const bare=line.toLowerCase().trim();
+      for(const k in FIELD_LABELS) if(FIELD_LABELS[k].indexOf(bare)>-1 && next) return {label:bare,value:next.trim()};
+      return null;
+    };
+    for(let i=0;i<lines.length;i++){
+      const g=grab(lines[i],lines[i+1]); if(!g||!g.value)continue;
+      for(const key in FIELD_LABELS){
+        if(found[key])continue;
+        if(FIELD_LABELS[key].some(lbl=>g.label===lbl||g.label.endsWith(lbl))){found[key]=g.value;break;}
+      }
+      if(!found.ownerFirst&&/^(member name|name|contact|owner)$/.test(g.label)||/^(member name|contact name|owner name)$/.test(g.label)){
+        const parts=g.value.replace(/[^A-Za-z '\-]/g,'').trim().split(/\s+/);
+        if(parts.length>=2){found.ownerFirst=parts[0];found.ownerLast=parts.slice(1).join(' ');}
+        else if(parts.length===1){found.ownerLast=parts[0];}
+      }
+    }
+    const whole=text.replace(/\n/g,' ');
+    if(!found.ownerPhone){const m=whole.match(/\(?\b\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}\b/);if(m)found.ownerPhone=m[0];}
+    if(!found.ownerEmail){const m=whole.match(/\b[\w.+-]+@[\w-]+\.[\w.]{2,}\b/);if(m)found.ownerEmail=m[0];}
+    if(!found.length){const m=whole.match(/\b(\d{2})\s?(?:ft|feet|')\b/i);if(m)found.length=m[1];}
+    if(!found.pob){const m=whole.match(/(\d{1,2})\s*(?:persons?|people|souls|pob)\b/i);if(m)found.pob=m[1];}
+    if(found.length)found.length=String(found.length).replace(/[^\d.]/g,'');
+    if(found.pob)found.pob=String(found.pob).replace(/[^\d]/g,'');
+    return found;
+  }
+
+  async function scanPhoto(pid){
+    const c=getCase(view.id); if(!c)return;
+    const dataURL=await idbImgGet(pid);
+    if(!dataURL){toast('Could not load that image',1);return;}
+    const el=document.createElement('div');el.className='modal';
+    el.innerHTML=`<div class="modal-in"><h3 class="lbl">Reading screenshot…</h3>
+      <div class="hint" id="ocrpct" style="margin:12px 0 4px">Loading the reader — first time takes a moment.</div></div>`;
+    document.body.appendChild(el);
+    try{
+      if(!window.Tesseract) await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js');
+      const r=await Tesseract.recognize(dataURL,'eng',{logger:m=>{
+        const pe=document.getElementById('ocrpct');
+        if(pe&&m.status==='recognizing text')pe.textContent='Reading… '+Math.round(m.progress*100)+'%';
+      }});
+      el.remove();
+      const found=parseDispatch(r.data.text||'');
+      const keys=Object.keys(found).filter(k=>found[k]);
+      if(!keys.length){toast('Could not pick out any fields — fill by hand from the photo',1);return;}
+      reviewFields(c,found,keys);
+    }catch(e){
+      el.remove();
+      toast('Reader could not load — needs a signal the first time',1);
+    }
+  }
+
+  function reviewFields(c,found,keys){
+    const rows=keys.map(k=>{
+      const taken=c[k]&&String(c[k]).trim();
+      return `<div class="set-item"><div class="n">${PRETTY[k]||k}<small style="display:block;color:var(--ink-dim)">${esc(found[k])}</small></div>
+        <div class="lbl" style="font-size:9px;color:${taken?'var(--ink-faint)':'var(--wake)'}">${taken?'ALREADY SET':'WILL FILL'}</div></div>`;
+    }).join('');
+    const fillable=keys.filter(k=>!(c[k]&&String(c[k]).trim()));
+    const el=document.createElement('div');el.className='modal';
+    el.innerHTML=`<div class="modal-in wide"><h3 class="lbl">Found on the screenshot</h3>
+      <div style="max-height:46vh;overflow:auto;margin:10px 0">${rows}</div>
+      <div class="hint">Only empty fields get filled — nothing you typed is touched. Double-check against the photo; the reader is good, not perfect.</div>
+      <div class="mrow">
+        <button class="btn ghost lbl" data-cancel>Cancel</button>
+        <button class="btn primary lbl" data-ok ${fillable.length?'':'disabled'}>Fill ${fillable.length} field${fillable.length===1?'':'s'}</button>
+      </div></div>`;
+    el.addEventListener('click',e=>{
+      if(e.target===el||e.target.closest('[data-cancel]')){el.remove();return;}
+      if(e.target.closest('[data-ok]')){
+        fillable.forEach(k=>{c[k]=found[k];});
+        persist();el.remove();render();
+        toast('Filled '+fillable.length+' field'+(fillable.length===1?'':'s'));
+      }
+    });
+    document.body.appendChild(el);
+  }
+
   function importModal(){
     const el=document.createElement('div');el.className='modal';
     el.innerHTML=`<div class="modal-in"><h3 class="lbl">Paste a backup</h3>
@@ -733,7 +848,7 @@
           ${photos}
           <button class="ph phadd" data-phadd>+<small class="lbl">Redcraft · email</small></button>
         </div>
-        <div class="hint" style="margin-top:8px">Drop the dispatch screenshot here the moment it comes in — boat, member and dispatch # ride along with the case.</div>
+        <div class="hint" style="margin-top:8px">Drop the dispatch screenshot here the moment it comes in. Then tap it and hit Read into case — boat, member, phone and dispatch # fill themselves.</div>
         <input type="file" accept="image/*" multiple style="display:none" data-phinput>
 
         <div class="sect-head lbl"><span>Notes from the water</span><span class="rule"></span></div>

@@ -143,6 +143,7 @@
   .ph.phadd{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;border:1.5px dashed var(--signal);color:var(--signal);font-size:24px;background:color-mix(in srgb,var(--signal) 5%,transparent)}
   .ph.phadd small{font-size:8.5px;letter-spacing:.1em}
   .photos.dragover .phadd{background:color-mix(in srgb,var(--signal) 14%,transparent)}
+  .ph.reading::after{content:'READING…';position:absolute;inset:auto 0 0 0;padding:3px 0;font:700 8.5px/1 'JetBrains Mono',monospace;letter-spacing:.08em;text-align:center;color:#fff;background:color-mix(in srgb,var(--signal) 85%,#000)}
   .phview img{max-width:100%;max-height:62vh;display:block;margin:0 auto;border:1px solid var(--rule);border-radius:3px}
 
   details{border-top:1px solid var(--rule)}
@@ -425,7 +426,7 @@
   }
   async function addPhotos(files){
     const c=getCase(view.id); if(!c)return;
-    let added=0;
+    let added=0; const fresh=[];
     for(const f of files){
       if(!f||!/^image\//.test(f.type))continue;
       const dataURL=await compressImage(f);
@@ -433,9 +434,15 @@
       const pid='p'+uid();
       await idbImgSet(pid,dataURL);
       (c.photos=c.photos||[]).push(pid);
+      fresh.push(pid);
       added++;
     }
-    if(added){persist();render();toast(added===1?'Screenshot attached':added+' attached');}
+    if(added){
+      fresh.forEach(pid=>readQueue.push({cid:c.id,pid}));
+      persist();render();
+      toast(added===1?'Screenshot attached — reading it':added+' attached — reading them');
+      pumpReader();
+    }
   }
   function hydratePhotos(){
     document.querySelectorAll('img[data-pid]').forEach(el=>{
@@ -448,7 +455,7 @@
       <img data-pid="${pid}" alt="attached screenshot">
       <div class="mrow" style="margin-top:12px">
         <button class="btn ghost lbl" data-phdel style="color:var(--alarm);flex:0 0 auto;width:auto;padding:12px 16px">Remove</button>
-        <button class="btn primary lbl" data-phscan>Read into case</button>
+        <button class="btn primary lbl" data-phscan>Read again</button>
         <button class="btn lbl" data-close style="flex:0 0 auto;width:auto;padding:12px 16px">Close</button>
       </div></div>`;
     el.addEventListener('click',e=>{
@@ -524,6 +531,56 @@
     return found;
   }
 
+  async function ocrText(dataURL,onPct){
+    if(!window.Tesseract) await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js');
+    const r=await Tesseract.recognize(dataURL,'eng',{logger:m=>{
+      if(onPct&&m.status==='recognizing text')onPct(Math.round(m.progress*100));
+    }});
+    return r.data.text||'';
+  }
+
+  /* auto-read: every new screenshot is read in the background, one at a time,
+     and fills only fields that are still empty. No button, no review step. */
+  const readQueue=[]; const readingNow=new Set(); let readerBusy=false;
+  function markReading(pid,on){
+    if(on)readingNow.add(pid);else readingNow.delete(pid);
+    document.querySelectorAll('[data-phview="'+pid+'"]').forEach(b=>b.classList.toggle('reading',on));
+  }
+  async function pumpReader(){
+    if(readerBusy)return; readerBusy=true;
+    while(readQueue.length){
+      const {cid,pid}=readQueue.shift();
+      const c=getCase(cid); if(!c||(c.photos||[]).indexOf(pid)<0)continue;
+      markReading(pid,true);
+      try{
+        const dataURL=await idbImgGet(pid);
+        if(!dataURL)throw 0;
+        const found=parseDispatch(await ocrText(dataURL));
+        const filled=Object.keys(found).filter(k=>found[k]&&!(c[k]&&String(c[k]).trim()));
+        filled.forEach(k=>{c[k]=found[k];});
+        markReading(pid,false);
+        if(filled.length){persist();refreshFilled(c,filled);}
+        const names=filled.map(k=>PRETTY[k]||k);
+        const label=getCase(view.id)===c?'':' ('+caseTitle(c)+')';
+        if(filled.length)toast('Filled '+names.slice(0,4).join(', ')+(names.length>4?' +'+(names.length-4)+' more':'')+label,0,3800);
+        else toast(Object.keys(found).length?'Screenshot read — those fields were already filled'+label:'Could not pick out any fields — fill by hand from the photo'+label,!Object.keys(found).length,3200);
+      }catch(e){
+        markReading(pid,false);
+        toast('Reader could not load — needs a signal the first time. Tap the screenshot → Read again.',1,4200);
+      }
+    }
+    readerBusy=false;
+  }
+  // put filled values on screen without wiping whatever the user is typing in
+  function refreshFilled(c,keys){
+    if(view.screen!=='case'||view.id!==c.id)return;
+    const a=document.activeElement;
+    const typing=a&&(a.tagName==='INPUT'||a.tagName==='TEXTAREA')&&a.dataset&&a.dataset.f;
+    if(!typing){render();return;}
+    keys.forEach(k=>document.querySelectorAll('[data-f="'+k+'"]').forEach(o=>{if(o!==a)o.value=c[k];}));
+    const h=document.getElementById('casetitle'); if(h)h.textContent=caseTitle(c);
+  }
+
   async function scanPhoto(pid){
     const c=getCase(view.id); if(!c)return;
     const dataURL=await idbImgGet(pid);
@@ -533,13 +590,9 @@
       <div class="hint" id="ocrpct" style="margin:12px 0 4px">Loading the reader — first time takes a moment.</div></div>`;
     document.body.appendChild(el);
     try{
-      if(!window.Tesseract) await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js');
-      const r=await Tesseract.recognize(dataURL,'eng',{logger:m=>{
-        const pe=document.getElementById('ocrpct');
-        if(pe&&m.status==='recognizing text')pe.textContent='Reading… '+Math.round(m.progress*100)+'%';
-      }});
+      const text=await ocrText(dataURL,pct=>{const pe=document.getElementById('ocrpct');if(pe)pe.textContent='Reading… '+pct+'%';});
       el.remove();
-      const found=parseDispatch(r.data.text||'');
+      const found=parseDispatch(text);
       const keys=Object.keys(found).filter(k=>found[k]);
       if(!keys.length){toast('Could not pick out any fields — fill by hand from the photo',1);return;}
       reviewFields(c,found,keys);
@@ -598,13 +651,14 @@
   const dayLabel=ts=>new Date(ts).toLocaleDateString(undefined,{month:'short',day:'numeric'});
   const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
   const money=n=>'$'+(Math.round(n*100)/100).toFixed(2);
-  function toast(msg,bad){
+  function toast(msg,bad,ms){
     const t=document.getElementById('toast');
     t.textContent=msg;
     t.style.background=bad?'var(--alarm)':'var(--wake)';
     t.style.color='#fff';
     t.classList.add('on');
-    setTimeout(()=>t.classList.remove('on'),2100);
+    clearTimeout(toast._t);
+    toast._t=setTimeout(()=>t.classList.remove('on'),ms||2100);
   }
   const getCase=id=>cases.find(c=>c.id===id);
   function caseTitle(c){
@@ -800,7 +854,7 @@
 
     const has=keys=>keys.some(k=>c[k]);
     const title=caseTitle(c);
-    const photos=(c.photos||[]).map(pid=>`<button class="ph" data-phview="${pid}"><img data-pid="${pid}" alt=""></button>`).join('');
+    const photos=(c.photos||[]).map(pid=>`<button class="ph${readingNow.has(pid)?' reading':''}" data-phview="${pid}"><img data-pid="${pid}" alt=""></button>`).join('');
 
     return `
       <div class="bar">
@@ -848,7 +902,7 @@
           ${photos}
           <button class="ph phadd" data-phadd>+<small class="lbl">Redcraft · email</small></button>
         </div>
-        <div class="hint" style="margin-top:8px">Drop the dispatch screenshot here the moment it comes in. Then tap it and hit Read into case — boat, member, phone and dispatch # fill themselves.</div>
+        <div class="hint" style="margin-top:8px">Drop or paste the dispatch screenshot or email here the moment it comes in. It gets read straight away — boat, member, phone and dispatch # fill themselves. Only empty fields are filled; anything you typed stays. Tap a screenshot to read it again.</div>
         <input type="file" accept="image/*" multiple style="display:none" data-phinput>
 
         <div class="sect-head lbl"><span>Notes from the water</span><span class="rule"></span></div>
@@ -1256,6 +1310,13 @@
   document.addEventListener('drop',e=>{
     const z=e.target.closest&&e.target.closest('[data-phzone]');
     if(z){e.preventDefault();z.classList.remove('dragover');if(e.dataTransfer&&e.dataTransfer.files.length)addPhotos([...e.dataTransfer.files]);}
+  });
+
+  document.addEventListener('paste',e=>{
+    if(view.screen!=='case'||!e.clipboardData)return;
+    const imgs=[...e.clipboardData.files].filter(f=>/^image\//.test(f.type));
+    if(!imgs.length)return;
+    e.preventDefault();addPhotos(imgs);
   });
 
   document.addEventListener('input',e=>{
